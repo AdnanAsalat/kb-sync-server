@@ -1,16 +1,20 @@
 // ============ SERVER-BACKED STORAGE SHIM ============
 // Ye extension ke "chrome.storage.local" / "chrome.runtime" APIs ko replicate karta
-// hai, lekin asal data Railway server (/kb) se aata/jaata hai. Isse hum extension ka
+// hai, lekin asal data Railway server se aata/jaata hai. Isse hum extension ka
 // pura dashboard logic (neeche) BINA CHANGE kiye yahan bhi chala sakte hain.
+//
+// IMPORTANT: har action (Train/Delete/Clear/Reset) ko alag, AUTHORITATIVE
+// endpoint pe bhejte hain (koi "purana data wapas merge ho jaye" wala bug nahi)
+// — bulk/additive actions (Import/Restore) ke liye purana safe merge-push hai.
 
 const SECRET_KEY = 'kb_dashboard_secret';
 let STORE = {};              // local_kb, unsolved_queue, task_numbers, task_counter, phash_index, snap:<hash>...
 let _onChangedListeners = [];
-let _pushTimer = null;
 let _ready = false;
 
 function getStoredSecret() { return localStorage.getItem(SECRET_KEY) || ''; }
 function setStoredSecret(s) { localStorage.setItem(SECRET_KEY, s); }
+function authHeaders() { return { 'Content-Type': 'application/json', 'X-Sync-Secret': getStoredSecret() }; }
 
 async function serverGet() {
   const secret = getStoredSecret();
@@ -26,11 +30,14 @@ async function serverPost(payload) {
   const secret = getStoredSecret();
   if (!secret) return false;
   try {
-    const r = await fetch('/kb', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Sync-Secret': secret },
-      body: JSON.stringify(payload)
-    });
+    const r = await fetch('/kb', { method: 'POST', headers: authHeaders(), body: JSON.stringify(payload) });
+    return r.ok;
+  } catch (e) { return false; }
+}
+
+async function callEndpoint(path, body) {
+  try {
+    const r = await fetch(path, { method: 'POST', headers: authHeaders(), body: JSON.stringify(body || {}) });
     return r.ok;
   } catch (e) { return false; }
 }
@@ -42,19 +49,16 @@ function applyServerPayload(p) {
   STORE.task_numbers = p.task_numbers || {};
   STORE.task_counter = p.task_counter || 0;
   STORE.phash_index = p.phash_index || {};
-  // Purani snap:<hash> keys saaf karke nayi daalo
   Object.keys(STORE).forEach(k => { if (k.indexOf('snap:') === 0) delete STORE[k]; });
   const snaps = p.snaps || {};
   for (const h in snaps) STORE['snap:' + h] = snaps[h];
 }
 
-// STORE se server payload shape banao (push ke liye)
 function buildPayloadFromStore() {
   const snaps = {};
   for (const k in STORE) if (k.indexOf('snap:') === 0) snaps[k.slice(5)] = STORE[k];
   return {
-    kb: STORE.local_kb || {},
-    snaps,
+    kb: STORE.local_kb || {}, snaps,
     unsolved: STORE.unsolved_queue || [],
     task_numbers: STORE.task_numbers || {},
     task_counter: STORE.task_counter || 0,
@@ -64,37 +68,82 @@ function buildPayloadFromStore() {
 
 async function pullFromServer() {
   const p = await serverGet();
-  if (!p || p._status) return p ? p._status : -1; // -1 = network fail, else HTTP status
+  if (!p || p._status) return p ? p._status : -1;
   applyServerPayload(p);
   _ready = true;
   _onChangedListeners.forEach(fn => fn({ unsolved_queue: {}, local_kb: {} }, 'local'));
   return 200;
 }
 
-function schedulePush() {
-  clearTimeout(_pushTimer);
-  _pushTimer = setTimeout(pushToServer, 600); // chhota debounce, kai set() calls = ek push
-}
-
-async function pushToServer() {
-  // Pehle fresh server data lao, merge karo (kahin doosra PC bhi ne update na kar diya ho)
+// Generic additive merge-push — SIRF bulk/additive actions (Import KB, Restore
+// Backup) ke liye. Ye kabhi kuch DELETE nahi karta, isliye safe hai.
+async function additiveMergePush() {
   const fresh = await serverGet();
   if (fresh && !fresh._status) {
     const remoteKb = fresh.kb || {};
-    const remoteUnsolved = fresh.unsolved || [];
-    const remoteSnaps = fresh.snaps || {};
-    // Local (jo abhi edit hua) jeetta hai conflict pe
     STORE.local_kb = Object.assign({}, remoteKb, STORE.local_kb || {});
     STORE.task_numbers = Object.assign({}, fresh.task_numbers || {}, STORE.task_numbers || {});
     STORE.phash_index = Object.assign({}, fresh.phash_index || {}, STORE.phash_index || {});
     STORE.task_counter = Math.max(fresh.task_counter || 0, STORE.task_counter || 0);
+    const remoteSnaps = fresh.snaps || {};
     for (const h in remoteSnaps) if (!STORE['snap:' + h]) STORE['snap:' + h] = remoteSnaps[h];
     const umap = {};
-    remoteUnsolved.forEach(it => { umap[it.hash] = it; });
+    (fresh.unsolved || []).forEach(it => { umap[it.hash] = it; });
     (STORE.unsolved_queue || []).forEach(it => { umap[it.hash] = it; });
     STORE.unsolved_queue = Object.values(umap).filter(it => !STORE.local_kb[it.hash]);
   }
   await serverPost(buildPayloadFromStore());
+}
+
+// Har .set() call ko CLASSIFY karo — Train/Delete/Clear/Reset ko seedha,
+// authoritative endpoint pe bhejo (koi merge nahi, isliye "purane wapas aana"
+// wala bug nahi hota). Baaki (Import/Restore — additive) purane merge se.
+async function handleSet(obj) {
+  const oldKb = STORE.local_kb || {};
+
+  // RESET ALL: kb khaali, counter 0, unsolved bhi key me
+  if (obj.hasOwnProperty('local_kb') && obj.hasOwnProperty('unsolved_queue') &&
+      obj.hasOwnProperty('task_counter') && obj.task_counter === 0 &&
+      Object.keys(obj.local_kb).length === 0) {
+    await callEndpoint('/reset-all');
+    return;
+  }
+
+  // TRAIN ya DELETE: dono keys ek saath aati hain (local_kb + unsolved_queue)
+  if (obj.hasOwnProperty('local_kb') && obj.hasOwnProperty('unsolved_queue')) {
+    const newKeys = Object.keys(obj.local_kb).length;
+    const oldKeys = Object.keys(oldKb).length;
+    if (newKeys > oldKeys) {
+      // TRAIN — exactly ek naya/badla hua hash dhoondo
+      let newHash = null;
+      for (const h in obj.local_kb) {
+        if (JSON.stringify(oldKb[h]) !== JSON.stringify(obj.local_kb[h])) { newHash = h; break; }
+      }
+      if (newHash) {
+        const snap = obj['snap:' + newHash];
+        const phash = obj.phash_index ? obj.phash_index[newHash] : undefined;
+        await callEndpoint('/train', { hash: newHash, solution: obj.local_kb[newHash], snap, phash });
+        return;
+      }
+    } else if (newKeys < oldKeys) {
+      // DELETE — jo hash purani kb me tha, nayi me nahi
+      const removedHash = Object.keys(oldKb).find(h => !(h in obj.local_kb));
+      if (removedHash) {
+        await callEndpoint('/delete-task', { hash: removedHash });
+        return;
+      }
+    }
+  }
+
+  // CLEAR QUEUE: sirf unsolved_queue:[] (local_kb key bilkul nahi)
+  if (!obj.hasOwnProperty('local_kb') && obj.hasOwnProperty('unsolved_queue') &&
+      Array.isArray(obj.unsolved_queue) && obj.unsolved_queue.length === 0) {
+    await callEndpoint('/clear-unsolved');
+    return;
+  }
+
+  // Baaki sab (Import KB, Restore Backup — additive) → purana safe merge
+  await additiveMergePush();
 }
 
 // ===== chrome.* shim (dashboard ka purana code yehi calls karta hai) =====
@@ -111,13 +160,15 @@ window.chrome = {
         cb(Object.assign({}, STORE));
       },
       set(obj, cb) {
-        Object.assign(STORE, obj);
-        schedulePush();
-        if (cb) cb();
+        handleSet(obj).then(() => {
+          Object.assign(STORE, obj);
+          if (cb) cb();
+        });
       },
       remove(keys, cb) {
+        // 'kb_backup' jaisi sirf-local cheezein — server ko batane ki zaroorat
+        // nahi (asal action uske baad wale .set() call se hota hai).
         (Array.isArray(keys) ? keys : [keys]).forEach(k => delete STORE[k]);
-        schedulePush();
         if (cb) cb();
       }
     },
