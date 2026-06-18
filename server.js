@@ -168,6 +168,21 @@ app.post('/delete-task', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ===== CLEAR UNSOLVED QUEUE (authoritative — koi merge nahi, seedha khaali) =====
+app.post('/clear-unsolved', auth, (req, res) => {
+  const store = readStore();
+  store.unsolved = [];
+  writeStore(store);
+  res.json({ ok: true });
+});
+
+// ===== RESET EVERYTHING (authoritative — koi merge nahi, sab khaali) =====
+app.post('/reset-all', auth, (req, res) => {
+  const fresh = { kb: {}, snaps: {}, unsolved: [], task_numbers: {}, task_counter: 0, phash_index: {} };
+  writeStore(fresh);
+  res.json({ ok: true });
+});
+
 // ===== BULK (dashboard ke Export/Import/Reset/listing ke liye) =====
 app.get('/kb', auth, (req, res) => {
   res.json(readStore());
