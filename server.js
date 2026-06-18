@@ -156,6 +156,15 @@ app.post('/train', auth, (req, res) => {
   res.json({ ok: true, number: store.task_numbers[t.hash] });
 });
 
+// ===== SINGLE UNSOLVED ITEM (chhota — agar site-training ko purani images
+// chahiye ho, local cache ke bina, seedha server se) =====
+app.get('/unsolved-item', auth, (req, res) => {
+  const hash = req.query.hash || '';
+  const store = readStore();
+  const item = (store.unsolved || []).find(it => it.hash === hash);
+  res.json({ found: !!item, item: item || null });
+});
+
 // ===== DELETE SINGLE TASK (dashboard delete button) =====
 app.post('/delete-task', auth, (req, res) => {
   const hash = (req.body || {}).hash;
