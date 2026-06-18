@@ -338,3 +338,663 @@ function makeCard(hash, item, isSolved) {
 
   const dateMs = isSolved ? (item.solvedAt || item.timestamp) : item.timestamp;
   const dateStr = dateMs ? new Date(dateMs).toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '';
+  const text = (item.text || '(no text)');
+
+  card.innerHTML = `
+    <div class="thumb">
+      <span class="num-badge">#${numOf(hash)}</span>
+      <span class="cat-badge ${cat}">${cat}</span>
+      ${thumbHTML(item, cat)}
+      <button class="del" title="Delete">🗑️</button>
+    </div>
+    <div class="meta">
+      <div class="title">${isSolved ? '✅ ' : ''}${escapeHtml(text)}</div>
+      <div class="sub">${dateStr}</div>
+    </div>`;
+
+  card.querySelector('.del').onclick = (ev) => { ev.stopPropagation(); quickDelete(hash); };
+  card.onclick = () => isSolved ? loadSolved(hash) : loadTask(item);
+  return card;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+}
+
+function quickDelete(hash) {
+  if (!confirm('Task #' + numOf(hash) + ' delete karein?')) return;
+  chrome.storage.local.get(['local_kb','unsolved_queue','solved_tasks'], (data) => {
+    let q = (data.unsolved_queue||[]).filter(i => i.hash !== hash);
+    let kbn = data.local_kb||{}; delete kbn[hash];
+    let solved = data.solved_tasks||{}; delete solved[hash];
+    chrome.storage.local.set({ unsolved_queue:q, local_kb:kbn, solved_tasks:solved }, () => {
+      chrome.storage.local.remove('snap:' + hash, () => {
+        if (currentKey === hash) { resetInputs(); showPlaceholder(); }
+        refresh();
+      });
+    });
+  });
+}
+
+// ============ LOAD TASK (unsolved) ============
+
+function resetInputs() {
+  selectedTiles.clear(); clickPoint = null; multiPoints = []; dragPairs = []; pendingSource = null;
+}
+
+function loadTask(task) {
+  currentKey = task.hash;
+  currentTask = task;
+  resetInputs();
+  showEditor(task, null);
+}
+
+function loadSolved(hash) {
+  chrome.storage.local.get(['solved_tasks'], (d) => {
+    const solved = d.solved_tasks || {};
+    const task = solved[hash] || { hash, text: '(no image saved)', type: kb[hash].actionType };
+    currentKey = hash;
+    currentTask = task;
+    resetInputs();
+    showEditor(task, kb[hash]); // prefill existing solution
+  });
+}
+
+function showEditor(task, existingSolution) {
+  // List view chhupao, editor view dikhao
+  $('listView').style.display = 'none';
+  $('editorView').style.display = 'block';
+  $('editNum').textContent = 'Task #' + numOf(task.hash);
+  window.scrollTo(0, 0);
+
+  $('taskText').textContent = task.text || '(no text)';
+
+  $('gridSection').style.display = 'none';
+  $('clickSection').style.display = 'none';
+  $('dragSection').style.display = 'none';
+  $('sliderRow').style.display = 'none';
+  $('exampleWrap').style.display = 'none';
+  $('actionOverride').value = existingSolution ? existingSolution.actionType : '';
+
+  if (task.exampleImage && task.exampleImage.length > 100) {
+    $('exampleImg').src = task.exampleImage;
+    $('exampleWrap').style.display = 'block';
+  }
+
+  // Decide which editor to show
+  let mode = existingSolution ? existingSolution.actionType : null;
+  if (!mode) {
+    if (task.type === 'grid') mode = 'click_indexes';
+    else if (task.type === 'drag') mode = 'drag_pairs';
+    else mode = 'click_point';
+  }
+
+  applyMode(mode, task, existingSolution);
+}
+
+// Show the right editor for a mode
+function applyMode(mode, task, sol) {
+  if (mode === 'replay') {
+    showReplay(task, sol);
+  } else if (mode === 'click_indexes') {
+    showGrid(task, sol);
+  } else if (mode === 'drag_pairs') {
+    showDrag(task, sol);
+  } else if (mode === 'slider') {
+    $('sliderRow').style.display = 'block';
+    if (sol && sol.targetX) $('sliderInput').value = sol.targetX;
+    // also show image for reference
+    showClickImageOnly(task);
+  } else { // click_point or multi_click
+    showClick(task, sol, mode === 'multi_click');
+  }
+}
+
+// Site-trained (replay) task — recorded clicks/drags ko dikhao
+function showReplay(task, sol) {
+  // Agar grid task hai aur tile indices store hain → grid montage me highlight
+  if (sol && sol.gridClicks && sol.gridClicks.length && task.tileImages && task.tileImages.length) {
+    $('gridSection').style.display = 'block';
+    const grid = $('tileGrid');
+    grid.innerHTML = '';
+    const tiles = task.tileImages;
+    grid.style.gridTemplateColumns = tiles.length > 9 ? 'repeat(4, 1fr)' : 'repeat(3, 1fr)';
+    const sel = new Set(sol.gridClicks);
+    tiles.forEach((src, i) => {
+      const tile = document.createElement('div');
+      tile.className = 'tile' + (sel.has(i) ? ' selected' : '');
+      const badge = document.createElement('span');
+      badge.className = 'idx-badge'; badge.textContent = i;
+      tile.appendChild(badge);
+      if (src && src.length > 100) {
+        const img = document.createElement('img'); img.src = src;
+        img.onerror = () => { tile.classList.add('no-img'); img.remove(); };
+        tile.appendChild(img);
+      } else tile.classList.add('no-img');
+      grid.appendChild(tile);
+    });
+    $('selectedInfo').innerHTML = `✅ <b>Site se trained</b> — green tiles = jo click hue`;
+    return;
+  }
+
+  // Warna image pe markers overlay
+  $('clickSection').style.display = 'block';
+  $('clickImg').src = imgSrcOf(task);
+  const area = $('clickArea');
+  area.querySelectorAll('.marker').forEach(m => m.remove());
+
+  const actions = (sol && sol.actions) || [];
+  let n = 0;
+  actions.forEach((a) => {
+    if (a.type === 'click') {
+      n++;
+      const m = document.createElement('div');
+      m.className = 'marker point';
+      m.style.left = a.x + '%'; m.style.top = a.y + '%';
+      m.textContent = n;
+      area.appendChild(m);
+    } else if (a.type === 'drag') {
+      const s = document.createElement('div');
+      s.className = 'marker src';
+      s.style.left = a.from.x + '%'; s.style.top = a.from.y + '%';
+      s.textContent = 'S';
+      area.appendChild(s);
+      const d = document.createElement('div');
+      d.className = 'marker dst';
+      d.style.left = a.to.x + '%'; d.style.top = a.to.y + '%';
+      d.textContent = 'D';
+      area.appendChild(d);
+    }
+  });
+
+  const clicks = actions.filter(a => a.type === 'click').length;
+  const drags = actions.filter(a => a.type === 'drag').length;
+  $('clickInfo').innerHTML = `✅ <b>Site se trained</b> — ${clicks} click(s)` +
+    (drags ? `, ${drags} drag(s)` : '') +
+    ` &nbsp; <span style="color:#64748b">(markers = recorded points)</span>`;
+}
+
+// When user changes override dropdown, switch editor live
+$('actionOverride').onchange = function() {
+  if (!currentTask) return;
+  const v = this.value || (currentTask.type === 'grid' ? 'click_indexes' : currentTask.type === 'drag' ? 'drag_pairs' : 'click_point');
+  resetInputs();
+  $('gridSection').style.display = 'none';
+  $('clickSection').style.display = 'none';
+  $('dragSection').style.display = 'none';
+  $('sliderRow').style.display = 'none';
+  applyMode(v, currentTask, null);
+};
+
+// ============ GRID ============
+
+function showGrid(task, sol) {
+  $('gridSection').style.display = 'block';
+  const grid = $('tileGrid');
+  grid.innerHTML = '';
+  const tiles = task.tileImages || [];
+  grid.style.gridTemplateColumns = tiles.length > 9 ? 'repeat(4, 1fr)' : 'repeat(3, 1fr)';
+  const preSel = (sol && sol.clicks) ? new Set(sol.clicks) : new Set();
+
+  (tiles.length ? tiles : new Array(task.tileCount || 9).fill('')).forEach((src, i) => {
+    const tile = document.createElement('div');
+    tile.className = 'tile';
+    if (preSel.has(i)) { tile.classList.add('selected'); selectedTiles.add(i); }
+    const badge = document.createElement('span');
+    badge.className = 'idx-badge'; badge.textContent = i;
+    tile.appendChild(badge);
+    if (src && src.length > 100) {
+      const img = document.createElement('img');
+      img.src = src;
+      img.onerror = () => { tile.classList.add('no-img'); img.remove(); };
+      tile.appendChild(img);
+    } else tile.classList.add('no-img');
+    tile.onclick = () => toggleTile(i, tile);
+    grid.appendChild(tile);
+  });
+  updateSelectedInfo();
+}
+
+function toggleTile(idx, el) {
+  if (selectedTiles.has(idx)) { selectedTiles.delete(idx); el.classList.remove('selected'); }
+  else { selectedTiles.add(idx); el.classList.add('selected'); }
+  updateSelectedInfo();
+}
+function updateSelectedInfo() {
+  const a = [...selectedTiles].sort((x,y)=>x-y);
+  $('selectedInfo').textContent = a.length ? 'Selected: ' + a.join(', ') : 'No tiles selected';
+}
+
+// ============ CLICK / MULTI ============
+
+function imgSrcOf(task) {
+  return task.mainImage || task.exampleImage || (task.tileImages && task.tileImages.find(t => t && t.length > 100)) || '';
+}
+
+function showClick(task, sol, multi) {
+  $('clickSection').style.display = 'block';
+  $('clickImg').src = imgSrcOf(task);
+  $('multiToggle').checked = !!multi || (sol && sol.actionType === 'multi_click');
+  $('clickArea').querySelectorAll('.marker').forEach(m => m.remove());
+  if (sol && sol.actionType === 'multi_click' && sol.points) { multiPoints = sol.points.slice(); }
+  else if (sol && sol.x !== undefined) { clickPoint = { x: sol.x, y: sol.y }; }
+  redrawClick();
+  $('clickInfo').textContent = 'Click to mark target';
+}
+
+function showClickImageOnly(task) {
+  $('clickSection').style.display = 'block';
+  $('clickImg').src = imgSrcOf(task);
+  $('clickArea').querySelectorAll('.marker').forEach(m => m.remove());
+  $('clickInfo').textContent = 'Slider mode — image reference sirf dekhne ke liye';
+}
+
+function redrawClick() {
+  const area = $('clickArea');
+  area.querySelectorAll('.marker').forEach(m => m.remove());
+  const multi = $('multiToggle').checked;
+  const pts = multi ? multiPoints : (clickPoint ? [clickPoint] : []);
+  pts.forEach((p, i) => {
+    const m = document.createElement('div');
+    m.className = 'marker point';
+    m.style.left = p.x + '%'; m.style.top = p.y + '%';
+    if (multi) m.textContent = i + 1;
+    area.appendChild(m);
+  });
+}
+
+$('clickArea').onclick = function(e) {
+  const img = $('clickImg');
+  const rect = img.getBoundingClientRect();
+  const x = parseFloat(((e.clientX - rect.left)/rect.width*100).toFixed(1));
+  const y = parseFloat(((e.clientY - rect.top)/rect.height*100).toFixed(1));
+  if ($('multiToggle').checked) {
+    multiPoints.push({x, y});
+    $('clickInfo').textContent = multiPoints.length + ' points marked';
+  } else {
+    clickPoint = {x, y};
+    $('clickInfo').textContent = `Marked: (${x}%, ${y}%)`;
+  }
+  redrawClick();
+};
+
+$('multiToggle').onchange = function() {
+  multiPoints = []; clickPoint = null;
+  $('clickInfo').textContent = this.checked ? 'Multi-click ON' : 'Click to mark';
+  redrawClick();
+};
+
+// ============ DRAG PAIRS ============
+
+function showDrag(task, sol) {
+  $('dragSection').style.display = 'block';
+  $('dragImg').src = imgSrcOf(task);
+  $('dragArea').querySelectorAll('.marker').forEach(m => m.remove());
+  dragPairs = (sol && sol.pairs) ? sol.pairs.slice() : [];
+  pendingSource = null;
+  redrawDrag();
+}
+
+$('dragArea').onclick = function(e) {
+  const img = $('dragImg');
+  const rect = img.getBoundingClientRect();
+  const x = parseFloat(((e.clientX - rect.left)/rect.width*100).toFixed(1));
+  const y = parseFloat(((e.clientY - rect.top)/rect.height*100).toFixed(1));
+
+  if (!pendingSource) {
+    pendingSource = {x, y};
+    $('dragInfo').textContent = `Source marked (${x}%, ${y}%) — ab DESTINATION pe click karo`;
+  } else {
+    dragPairs.push({ from: pendingSource, to: {x, y} });
+    pendingSource = null;
+    $('dragInfo').textContent = `${dragPairs.length} move(s) marked. Aur move ho to SOURCE pe click karo.`;
+  }
+  redrawDrag();
+};
+
+function redrawDrag() {
+  const area = $('dragArea');
+  area.querySelectorAll('.marker').forEach(m => m.remove());
+  dragPairs.forEach((p, i) => {
+    addMarker(area, 'src', p.from.x, p.from.y, 'S' + (i+1));
+    addMarker(area, 'dst', p.to.x, p.to.y, 'D' + (i+1));
+  });
+  if (pendingSource) addMarker(area, 'src', pendingSource.x, pendingSource.y, 'S?');
+  // List
+  $('dragPairsList').innerHTML = dragPairs.map((p,i) =>
+    `<span class="pair">Move ${i+1}: (${p.from.x},${p.from.y}) → (${p.to.x},${p.to.y})</span>`).join('');
+}
+
+function addMarker(area, cls, x, y, label) {
+  const m = document.createElement('div');
+  m.className = 'marker ' + cls;
+  m.style.left = x + '%'; m.style.top = y + '%';
+  m.textContent = label;
+  area.appendChild(m);
+}
+
+// ============ UNDO ============
+
+$('undoBtn').onclick = function() {
+  const mode = $('actionOverride').value || (currentTask && currentTask.type === 'grid' ? 'click_indexes' : currentTask && currentTask.type === 'drag' ? 'drag_pairs' : 'click_point');
+  if (mode === 'drag_pairs') {
+    if (pendingSource) { pendingSource = null; }
+    else dragPairs.pop();
+    redrawDrag();
+  } else if (mode === 'multi_click') {
+    multiPoints.pop(); redrawClick();
+  } else if (mode === 'click_point') {
+    clickPoint = null; redrawClick();
+  }
+};
+
+// ============ SAVE ============
+
+$('saveBtn').onclick = function() {
+  if (!currentTask) return;
+  const task = currentTask;
+  const override = $('actionOverride').value;
+  let type = override;
+  if (!type) {
+    if (task.type === 'grid') type = 'click_indexes';
+    else if (task.type === 'drag') type = 'drag_pairs';
+    else if ($('multiToggle').checked) type = 'multi_click';
+    else type = 'click_point';
+  }
+
+  let solution = { actionType: type, savedText: task.text };
+
+  if (type === 'click_indexes') {
+    const c = [...selectedTiles].sort((a,b)=>a-b);
+    if (!c.length) { alert('Tiles select karein!'); return; }
+    solution.clicks = c;
+  } else if (type === 'click_point') {
+    if (!clickPoint) { alert('Point mark karein!'); return; }
+    solution.x = clickPoint.x; solution.y = clickPoint.y;
+  } else if (type === 'multi_click') {
+    if (!multiPoints.length) { alert('Points mark karein!'); return; }
+    solution.points = multiPoints;
+  } else if (type === 'drag_pairs') {
+    if (!dragPairs.length) { alert('Kam se kam ek drag (source+dest) mark karein!'); return; }
+    solution.pairs = dragPairs;
+  } else if (type === 'slider') {
+    const v = parseInt($('sliderInput').value);
+    if (isNaN(v)) { alert('Pixels likhein!'); return; }
+    solution.targetX = v;
+  }
+
+  const btn = $('saveBtn');
+  btn.textContent = '⏳ Saving...'; btn.disabled = true;
+
+  chrome.storage.local.get(['local_kb', 'unsolved_queue'], (data) => {
+    let kbn = data.local_kb || {};
+    kbn[task.hash] = solution;
+    // Snapshot ALAG key me — save tez (poora blob nahi likhna padta)
+    const snap = {
+      hash: task.hash, text: task.text, type: task.type,
+      exampleImage: task.exampleImage, mainImage: task.mainImage,
+      tileImages: task.tileImages, tileCount: task.tileCount,
+      solvedAt: Date.now()
+    };
+    let q = (data.unsolved_queue || []).filter(i => i.hash !== task.hash);
+    const setObj = { local_kb: kbn, unsolved_queue: q, ['snap:' + task.hash]: snap };
+    // Manual/uploaded task ka pHash index me daalo (live match ke liye)
+    if (task._phash) {
+      chrome.storage.local.get(['phash_index'], (pd) => {
+        const idx = pd.phash_index || {};
+        idx[task.hash] = task._phash;
+        setObj.phash_index = idx;
+        chrome.storage.local.set(setObj, afterSave);
+      });
+    } else {
+      chrome.storage.local.set(setObj, afterSave);
+    }
+    function afterSave() {
+      btn.textContent = '💾 Save to KB'; btn.disabled = false;
+      chrome.runtime.sendMessage({ type: 'LIVE_HIGHLIGHT', hash: task.hash, solution: solution, taskNumber: taskNumbers[task.hash] });
+      resetInputs(); showPlaceholder();
+    }
+  });
+};
+
+// ============ SKIP / DELETE ============
+
+$('skipBtn').onclick = function() {
+  if (!currentTask) return;
+  const h = currentTask.hash;
+  chrome.storage.local.get(['local_kb','unsolved_queue','solved_tasks'], (data) => {
+    let q = (data.unsolved_queue||[]).filter(i => i.hash !== h);
+    let kbn = data.local_kb||{}; delete kbn[h];
+    let solved = data.solved_tasks||{}; delete solved[h];
+    chrome.storage.local.set({ unsolved_queue:q, local_kb:kbn, solved_tasks:solved }, () => {
+      resetInputs(); showPlaceholder(); refresh();
+    });
+  });
+};
+
+function showPlaceholder() {
+  $('editorView').style.display = 'none';
+  $('listView').style.display = 'block';
+  currentKey = null; currentTask = null;
+  refresh();
+}
+
+$('backBtn').onclick = () => { resetInputs(); showPlaceholder(); };
+
+// ============ EXPORT / IMPORT / CLEAR ============
+
+$('exportBtn').onclick = function() {
+  chrome.storage.local.get(['local_kb','solved_tasks'], (data) => {
+    const out = { kb: data.local_kb||{}, solved: data.solved_tasks||{} };
+    const blob = new Blob([JSON.stringify(out,null,2)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'hcaptcha-kb-' + new Date().toISOString().slice(0,10) + '.json';
+    a.click();
+  });
+};
+
+$('importBtn').onclick = () => $('importFile').click();
+$('importFile').onchange = function() {
+  const file = this.files[0]; if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const imp = JSON.parse(e.target.result);
+      const impKb = imp.kb || imp; // backward compat
+      const impSolved = imp.solved || {};
+      chrome.storage.local.get(['local_kb','solved_tasks'], (data) => {
+        let kbn = data.local_kb||{}, solved = data.solved_tasks||{}, c=0;
+        for (const k in impKb) { if(!kbn[k]){ kbn[k]=impKb[k]; c++; } }
+        for (const k in impSolved) { if(!solved[k]) solved[k]=impSolved[k]; }
+        chrome.storage.local.set({local_kb:kbn, solved_tasks:solved}, () => { alert(c+' imported!'); refresh(); });
+      });
+    } catch(err){ alert('Invalid JSON!'); }
+  };
+  reader.readAsText(file);
+};
+
+$('clearQueueBtn').onclick = function() {
+  if (!confirm('Unsolved queue + purana backup clear karein? (KB safe rahega)')) return;
+  // Queue aur purana backup dono saaf — storage free karne ke liye
+  chrome.storage.local.remove(['unsolved_queue', 'kb_backup'], () => {
+    chrome.storage.local.set({ unsolved_queue: [] }, () => { showPlaceholder(); refresh(); });
+  });
+};
+
+$('resetAllBtn').onclick = function() {
+  if (!confirm('⚠️ SAB KUCH delete ho jayega:\n• Saari Trained training (KB)\n• Unsolved queue\n• Task numbers\n• Backup\n\nYe wapas nahi aayega. Pakka?')) return;
+  if (!confirm('Aakhri baar: Sach me sab kuch reset karna hai?')) return;
+  chrome.storage.local.get(null, (all) => {
+    const snapKeys = Object.keys(all).filter(k => k.indexOf('snap:') === 0);
+    const toRemove = ['local_kb', 'unsolved_queue', 'solved_tasks', 'task_numbers', 'task_counter', 'kb_backup'].concat(snapKeys);
+    chrome.storage.local.remove(toRemove, () => {
+      chrome.storage.local.set({
+        local_kb: {}, unsolved_queue: [], solved_tasks: {},
+        task_numbers: {}, task_counter: 0
+      }, () => {
+        alert('✅ Sab kuch reset ho gaya. Numbers ab #1 se shuru honge.');
+        kb = {}; queue = []; solvedSnaps = {}; taskNumbers = {};
+        showPlaceholder(); refresh();
+      });
+    });
+  });
+};
+
+$('restoreBtn').onclick = function() {
+  chrome.storage.local.get(['kb_backup'], (data) => {
+    const bk = data.kb_backup;
+    if (!bk) { alert('Koi backup nahi mila.'); return; }
+    const when = new Date(bk.backedUpAt).toLocaleString();
+    const kbCount = Object.keys(bk.kb || {}).length;
+    if (!confirm(`Backup restore karein?\n\nBackup time: ${when}\nKB entries: ${kbCount}\n\nYe current KB ke saath merge hoga.`)) return;
+    chrome.storage.local.get(['local_kb', 'solved_tasks'], (cur) => {
+      let kbn = cur.local_kb || {}, solved = cur.solved_tasks || {}, c = 0;
+      for (const k in bk.kb) { if (!kbn[k]) { kbn[k] = bk.kb[k]; c++; } }
+      for (const k in (bk.solved || {})) { if (!solved[k]) solved[k] = bk.solved[k]; }
+      chrome.storage.local.set({ local_kb: kbn, solved_tasks: solved }, () => {
+        alert(c + ' entries restored!'); refresh();
+      });
+    });
+  });
+};
+
+// ============ MANUAL ADD (apni image se train) ============
+
+function aHashFromImg(imgEl) {
+  try {
+    const size = 8;
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(imgEl, 0, 0, size, size);
+    const d = ctx.getImageData(0, 0, size, size).data;
+    const gray = [];
+    for (let i = 0; i < d.length; i += 4) gray.push(d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114);
+    const avg = gray.reduce((a,b)=>a+b,0) / gray.length;
+    let bits = '';
+    for (const g of gray) bits += (g >= avg ? '1' : '0');
+    return bits;
+  } catch (e) { return null; }
+}
+
+$('manualAddBtn').onclick = () => $('manualImgFile').click();
+
+$('manualImgFile').onchange = function() {
+  const file = this.files && this.files[0];
+  this.value = '';
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const dataUrl = reader.result;
+    const text = prompt('Is task ka instruction/text likhein (jaise: "Click the boat"):', '');
+    if (text === null) return;
+    const img = new Image();
+    img.onload = () => {
+      const phash = aHashFromImg(img);
+      chrome.storage.local.get(['task_numbers', 'task_counter'], (d) => {
+        const map = d.task_numbers || {};
+        const next = (d.task_counter || 0) + 1;
+        const hash = 'm_' + Date.now().toString(36);
+        map[hash] = next;
+        chrome.storage.local.set({ task_numbers: map, task_counter: next }, () => {
+          taskNumbers = map;
+          const task = {
+            hash, text: text || '(manual)', type: 'click',
+            mainImage: dataUrl, _phash: phash, isManual: true
+          };
+          currentTask = task; currentKey = hash;
+          resetInputs();
+          showEditor(task, null);
+          $('actionOverride').value = '';
+          applyMode('click_point', task, null);
+          $('clickInfo').textContent = 'Apni image — point(s) mark karein, phir Save to KB';
+        });
+      });
+    };
+    img.src = dataUrl;
+  };
+  reader.readAsDataURL(file);
+};
+
+// ============ WEB DASHBOARD INIT ============
+
+$('syncUrlText').textContent = location.origin;
+
+function setStatus(text, color) {
+  $('syncStatus').textContent = text;
+  $('syncStatus').style.color = color;
+}
+
+async function tryConnect(secret, silent) {
+  setStoredSecret(secret);
+  if (!silent) setStatus('⏳ connect ho raha...', '#94a3b8');
+  const status = await pullFromServer();
+  if (status === 200) {
+    setStatus('✅ connected', '#4ade80');
+    $('listView').style.display = '';
+    refresh();
+    return true;
+  } else if (status === 401) {
+    setStatus('❌ galat secret', '#f87171');
+  } else if (status === -1) {
+    setStatus('❌ connect nahi hua (internet check karein)', '#f87171');
+  } else {
+    setStatus('❌ server error', '#f87171');
+  }
+  return false;
+}
+
+$('syncSaveBtn').onclick = () => {
+  const s = ($('syncSecretInput').value || '').trim();
+  if (!s) { alert('Secret daalein.'); return; }
+  tryConnect(s, false);
+};
+$('syncTestBtn').onclick = () => {
+  const s = ($('syncSecretInput').value || '').trim();
+  if (!s) { alert('Secret daalein.'); return; }
+  tryConnect(s, false);
+};
+$('refreshBtn').onclick = async () => {
+  const btn = $('refreshBtn');
+  const old = btn.textContent; btn.disabled = true; btn.textContent = '⏳ Syncing...';
+  setStatus('⏳ sync ho raha...', '#94a3b8');
+  const status = await pullFromServer();
+  setStatus(status === 200 ? '✅ synced' : '❌ sync error', status === 200 ? '#4ade80' : '#f87171');
+  btn.disabled = false; btn.textContent = old;
+  refresh();
+};
+
+// Pehli load: agar pehle se secret saved hai to seedha connect karo
+(async () => {
+  const saved = getStoredSecret();
+  if (saved) {
+    $('syncSecretInput').value = saved;
+    $('listView').style.display = 'none';
+    await tryConnect(saved, true);
+  } else {
+    $('listView').style.display = 'none';
+    setStatus('⚠️ secret daal kar Save dabayein', '#fbbf24');
+  }
+})();
+
+// Dashboard JAB TAK KHULA HAI tabhi tak — har 12 sec me halka silent sync
+// (taake doosre PC/browser ka naya unsolved task yahan khud aa jaye, live feel).
+// Tab band karo to ye khud band ho jata hai.
+const _liveInterval = setInterval(async () => {
+  if (!_ready) return;
+  if (currentTask) return; // editor khula hai — disturb mat karo
+  if ($('editorView').style.display === 'block') return;
+  const status = await pullFromServer();
+  if (status === 200) refresh();
+}, 12000);
+window.addEventListener('beforeunload', () => clearInterval(_liveInterval));
+
+// Jab pullFromServer() data badle to render update karo (debounced)
+let liveTimer = null;
+chrome.storage.onChanged.addListener(() => {
+  if (currentTask) return;
+  if ($('editorView').style.display === 'block') return;
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(refresh, 200);
+});
