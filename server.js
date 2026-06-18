@@ -54,7 +54,7 @@ app.get('/', (req, res) => {
 app.get('/kb', auth, (req, res) => {
   try {
     if (!fs.existsSync(KB_FILE)) {
-      return res.json({ kb: {}, snaps: {}, task_numbers: {}, task_counter: 0, phash_index: {}, updatedAt: 0 });
+      return res.json({ kb: {}, snaps: {}, unsolved: [], task_numbers: {}, task_counter: 0, phash_index: {}, updatedAt: 0 });
     }
     const raw = fs.readFileSync(KB_FILE, 'utf8');
     res.type('application/json').send(raw);
@@ -63,20 +63,21 @@ app.get('/kb', auth, (req, res) => {
   }
 });
 
-// KB PUSH — is PC ka KB cloud pe save karo
+// KB PUSH — is PC ka KB + unsolved cloud pe save karo
 app.post('/kb', auth, (req, res) => {
   try {
     const body = req.body || {};
     const payload = {
       kb: body.kb || {},
       snaps: body.snaps || {},
+      unsolved: body.unsolved || [],
       task_numbers: body.task_numbers || {},
       task_counter: body.task_counter || 0,
       phash_index: body.phash_index || {},
       updatedAt: Date.now()
     };
     fs.writeFileSync(KB_FILE, JSON.stringify(payload));
-    res.json({ ok: true, updatedAt: payload.updatedAt, kbCount: Object.keys(payload.kb).length });
+    res.json({ ok: true, updatedAt: payload.updatedAt, kbCount: Object.keys(payload.kb).length, unsolvedCount: payload.unsolved.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
