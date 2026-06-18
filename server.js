@@ -22,6 +22,9 @@ try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 // Bade JSON allow karo (KB me compressed base64 images hoti hain)
 app.use(express.json({ limit: '60mb' }));
 
+// Live web dashboard (HTML/JS) — public/ folder se serve hota hai
+app.use(express.static(path.join(__dirname, 'public')));
+
 // CORS — extension (chrome-extension://...) se requests allow karo
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -38,8 +41,8 @@ function auth(req, res, next) {
   next();
 }
 
-// Health check (browser me khol kar dekh sakte ho server zinda hai)
-app.get('/', (req, res) => {
+// Health check (JSON) — / ab live dashboard serve karta hai
+app.get('/health', (req, res) => {
   let info = { ok: true, service: 'hCaptcha KB Sync', exists: false };
   try {
     const st = fs.statSync(KB_FILE);
