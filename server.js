@@ -1,6 +1,7 @@
 // hCaptcha Trainer Pro — KB Sync Server
-// Lightweight: bas KB (JSON) store karta hai aur 2 PCs ke beech sync karta hai.
-// Koi background processing nahi — sirf pull (GET) aur push (POST).
+// Design: LIGHTWEIGHT, TARGETED calls — har task individually turant server pe
+// jaata hai (poori KB dobara nahi bhejni padti), taake slow internet pe bhi
+// foran sync ho aur koi naya task miss na ho.
 
 const express = require('express');
 const fs = require('fs');
@@ -10,19 +11,13 @@ const app = express();
 
 // ===== CONFIG (Railway environment variables se aati hain) =====
 const PORT = process.env.PORT || 3000;
-// SECRET: sirf aap jaante ho. Dono PCs me yahi daalna hoga. Railway Variables me set karein.
 const SECRET = process.env.SYNC_SECRET || 'change-me-please';
-// DATA_DIR: Railway Volume ka mount path (permanent storage). Default /data
 const DATA_DIR = process.env.DATA_DIR || '/data';
 const KB_FILE = path.join(DATA_DIR, 'kb.json');
 
-// Data folder bana lo agar na ho
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 
-// Bade JSON allow karo (KB me compressed base64 images hoti hain)
 app.use(express.json({ limit: '60mb' }));
-
-// Live web dashboard (HTML/JS) — public/ folder se serve hota hai
 app.use(express.static(path.join(__dirname, 'public')));
 
 // CORS — extension (chrome-extension://...) se requests allow karo
@@ -34,56 +29,162 @@ app.use((req, res, next) => {
   next();
 });
 
-// Secret check middleware — galat secret = reject
 function auth(req, res, next) {
   const given = req.header('X-Sync-Secret') || req.query.secret || '';
   if (given !== SECRET) return res.status(401).json({ error: 'Unauthorized — galat secret' });
   next();
 }
 
-// Health check (JSON) — / ab live dashboard serve karta hai
+// ===== STORAGE HELPERS =====
+function readStore() {
+  try {
+    return JSON.parse(fs.readFileSync(KB_FILE, 'utf8'));
+  } catch (e) {
+    return { kb: {}, snaps: {}, unsolved: [], task_numbers: {}, task_counter: 0, phash_index: {} };
+  }
+}
+function writeStore(store) {
+  store.updatedAt = Date.now();
+  fs.writeFileSync(KB_FILE, JSON.stringify(store));
+  return store;
+}
+function hammingDist(a, b) {
+  if (!a || !b || a.length !== b.length) return 999;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++;
+  return d;
+}
+
+// ===== HEALTH =====
 app.get('/health', (req, res) => {
-  let info = { ok: true, service: 'hCaptcha KB Sync', exists: false };
-  try {
-    const st = fs.statSync(KB_FILE);
-    info.exists = true;
-    info.sizeKB = Math.round(st.size / 1024);
-    info.updatedAt = st.mtime;
-  } catch (e) {}
-  res.json(info);
+  const s = readStore();
+  res.json({
+    ok: true, service: 'hCaptcha KB Sync',
+    kbCount: Object.keys(s.kb || {}).length,
+    unsolvedCount: (s.unsolved || []).length
+  });
 });
 
-// KB PULL — cloud se latest KB lao
-app.get('/kb', auth, (req, res) => {
-  try {
-    if (!fs.existsSync(KB_FILE)) {
-      return res.json({ kb: {}, snaps: {}, unsolved: [], task_numbers: {}, task_counter: 0, phash_index: {}, updatedAt: 0 });
+// ===== LIGHTWEIGHT: SOLVE CHECK =====
+// Extension har naye/unknown challenge pe ye call karta hai. Chhota, tez —
+// koi images nahi, sirf solution data. Slow internet pe bhi foran response.
+app.get('/solve', auth, (req, res) => {
+  const hash = req.query.hash || '';
+  const phash = req.query.phash || '';
+  const store = readStore();
+  if (hash && store.kb[hash]) {
+    return res.json({ found: true, solution: store.kb[hash], number: (store.task_numbers || {})[hash] || null });
+  }
+  if (phash) {
+    const idx = store.phash_index || {};
+    let best = null, bestDist = 999;
+    for (const h in idx) {
+      if (!store.kb[h]) continue;
+      const d = hammingDist(phash, idx[h]);
+      if (d < bestDist) { bestDist = d; best = h; }
     }
-    const raw = fs.readFileSync(KB_FILE, 'utf8');
-    res.type('application/json').send(raw);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    if (best && bestDist <= 5) {
+      return res.json({ found: true, solution: store.kb[best], number: (store.task_numbers || {})[best] || null });
+    }
   }
+  res.json({ found: false });
 });
 
-// KB PUSH — is PC ka KB + unsolved cloud pe save karo
-app.post('/kb', auth, (req, res) => {
-  try {
-    const body = req.body || {};
-    const payload = {
-      kb: body.kb || {},
-      snaps: body.snaps || {},
-      unsolved: body.unsolved || [],
-      task_numbers: body.task_numbers || {},
-      task_counter: body.task_counter || 0,
-      phash_index: body.phash_index || {},
-      updatedAt: Date.now()
-    };
-    fs.writeFileSync(KB_FILE, JSON.stringify(payload));
-    res.json({ ok: true, updatedAt: payload.updatedAt, kbCount: Object.keys(payload.kb).length, unsolvedCount: payload.unsolved.length });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+// ===== LIGHTWEIGHT: REPORT NEW UNSOLVED TASK =====
+// Naya challenge mile (koi PC bhi) → turant ye call hota hai (sirf is ONE task
+// ka data, poori KB nahi). Foran central dashboard me dikh jaata hai.
+app.post('/unsolved', auth, (req, res) => {
+  const t = req.body || {};
+  if (!t.hash) return res.status(400).json({ error: 'hash required' });
+  const store = readStore();
+  store.kb = store.kb || {};
+  store.unsolved = store.unsolved || [];
+  store.task_numbers = store.task_numbers || {};
+  store.phash_index = store.phash_index || {};
+
+  // Agar beech me kisi ne already train kar diya, wahi solution wapas de do
+  if (store.kb[t.hash]) {
+    return res.json({ ok: true, alreadyTrained: true, solution: store.kb[t.hash], number: store.task_numbers[t.hash] || null });
   }
+
+  const entry = {
+    hash: t.hash, text: t.text || '', type: t.type || 'click',
+    exampleImage: t.exampleImage || '', mainImage: t.mainImage || '',
+    tileImages: t.tileImages || undefined, tileCount: t.tileCount || 0,
+    timestamp: t.timestamp || Date.now()
+  };
+  const idx = store.unsolved.findIndex(it => it.hash === t.hash);
+  if (idx >= 0) store.unsolved[idx] = entry;
+  else {
+    store.unsolved.unshift(entry);
+    if (store.unsolved.length > 300) store.unsolved.splice(300);
+  }
+
+  if (!store.task_numbers[t.hash]) {
+    store.task_counter = (store.task_counter || 0) + 1;
+    store.task_numbers[t.hash] = store.task_counter;
+  }
+  if (t.phash) store.phash_index[t.hash] = t.phash;
+
+  writeStore(store);
+  res.json({ ok: true, alreadyTrained: false, number: store.task_numbers[t.hash] });
+});
+
+// ===== LIGHTWEIGHT: REPORT TRAINED SOLUTION =====
+// Kisi ne (site pe ya dashboard se) solve/train kar diya → turant ye call hota
+// hai, sab PCs ke /solve checks ko FORAN naya solution mil jaata hai.
+app.post('/train', auth, (req, res) => {
+  const t = req.body || {};
+  if (!t.hash || !t.solution) return res.status(400).json({ error: 'hash and solution required' });
+  const store = readStore();
+  store.kb = store.kb || {};
+  store.snaps = store.snaps || {};
+  store.unsolved = store.unsolved || [];
+  store.task_numbers = store.task_numbers || {};
+  store.phash_index = store.phash_index || {};
+
+  store.kb[t.hash] = t.solution;
+  if (t.snap) store.snaps[t.hash] = t.snap;
+  store.unsolved = store.unsolved.filter(it => it.hash !== t.hash);
+  if (t.phash) store.phash_index[t.hash] = t.phash;
+  if (!store.task_numbers[t.hash]) {
+    store.task_counter = (store.task_counter || 0) + 1;
+    store.task_numbers[t.hash] = store.task_counter;
+  }
+
+  writeStore(store);
+  res.json({ ok: true, number: store.task_numbers[t.hash] });
+});
+
+// ===== DELETE SINGLE TASK (dashboard delete button) =====
+app.post('/delete-task', auth, (req, res) => {
+  const hash = (req.body || {}).hash;
+  if (!hash) return res.status(400).json({ error: 'hash required' });
+  const store = readStore();
+  delete (store.kb || {})[hash];
+  delete (store.snaps || {})[hash];
+  store.unsolved = (store.unsolved || []).filter(it => it.hash !== hash);
+  writeStore(store);
+  res.json({ ok: true });
+});
+
+// ===== BULK (dashboard ke Export/Import/Reset/listing ke liye) =====
+app.get('/kb', auth, (req, res) => {
+  res.json(readStore());
+});
+
+app.post('/kb', auth, (req, res) => {
+  const body = req.body || {};
+  const payload = {
+    kb: body.kb || {},
+    snaps: body.snaps || {},
+    unsolved: body.unsolved || [],
+    task_numbers: body.task_numbers || {},
+    task_counter: body.task_counter || 0,
+    phash_index: body.phash_index || {}
+  };
+  writeStore(payload);
+  res.json({ ok: true, updatedAt: payload.updatedAt, kbCount: Object.keys(payload.kb).length, unsolvedCount: payload.unsolved.length });
 });
 
 app.listen(PORT, () => {
