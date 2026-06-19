@@ -485,17 +485,16 @@ function escapeHtml(s) {
 
 function quickDelete(hash) {
   if (!confirm('Task #' + numOf(hash) + ' delete karein?')) return;
-  chrome.storage.local.get(['local_kb','unsolved_queue','solved_tasks'], (data) => {
-    let q = (data.unsolved_queue||[]).filter(i => i.hash !== hash);
-    let kbn = data.local_kb||{}; delete kbn[hash];
-    let solved = data.solved_tasks||{}; delete solved[hash];
-    chrome.storage.local.set({ unsolved_queue:q, local_kb:kbn, solved_tasks:solved }, () => {
-      chrome.storage.local.remove('snap:' + hash, () => {
-        if (currentKey === hash) { resetInputs(); showPlaceholder(); }
-        refresh();
-      });
-    });
-  });
+  (async () => {
+    await callEndpoint('/delete-task', { hash });
+    if (window.STORE) {
+      if (window.STORE.local_kb) delete window.STORE.local_kb[hash];
+      window.STORE.unsolved_queue = (window.STORE.unsolved_queue || []).filter(i => i.hash !== hash);
+      delete window.STORE['snap:' + hash];
+    }
+    if (currentKey === hash) { resetInputs(); showPlaceholder(); }
+    refresh();
+  })();
 }
 
 // ============ LOAD TASK (unsolved) ============
@@ -864,35 +863,31 @@ $('saveBtn').onclick = function() {
   const btn = $('saveBtn');
   btn.textContent = '⏳ Saving...'; btn.disabled = true;
 
-  chrome.storage.local.get(['local_kb', 'unsolved_queue'], (data) => {
-    let kbn = data.local_kb || {};
-    kbn[task.hash] = solution;
-    // Snapshot ALAG key me — save tez (poora blob nahi likhna padta)
-    const snap = {
-      hash: task.hash, text: task.text, type: task.type,
-      exampleImage: task.exampleImage, mainImage: task.mainImage,
-      tileImages: task.tileImages, tileCount: task.tileCount,
-      solvedAt: Date.now()
-    };
-    let q = (data.unsolved_queue || []).filter(i => i.hash !== task.hash);
-    const setObj = { local_kb: kbn, unsolved_queue: q, ['snap:' + task.hash]: snap };
-    // Manual/uploaded task ka pHash index me daalo (live match ke liye)
-    if (task._phash) {
-      chrome.storage.local.get(['phash_index'], (pd) => {
-        const idx = pd.phash_index || {};
-        idx[task.hash] = task._phash;
-        setObj.phash_index = idx;
-        chrome.storage.local.set(setObj, afterSave);
-      });
-    } else {
-      chrome.storage.local.set(setObj, afterSave);
+  // Snapshot (images) — agar editor me already images hain to wahi, warna
+  // server khud purani queued images use kar lega (train endpoint me fallback).
+  const snap = {
+    hash: task.hash, text: task.text, type: task.type,
+    exampleImage: task.exampleImage, mainImage: task.mainImage,
+    tileImages: task.tileImages, tileCount: task.tileCount,
+    solvedAt: Date.now()
+  };
+
+  // SEEDHA /train endpoint — koi guess/merge nahi, isliye foran aur reliable.
+  (async () => {
+    const ok = await callEndpoint('/train', {
+      hash: task.hash, solution, snap, phash: task._phash
+    });
+    btn.textContent = '💾 Save to KB'; btn.disabled = false;
+    if (!ok) { alert('Save fail — internet/secret check karein.'); return; }
+    // Local STORE me bhi turant reflect karo (taake list foran update ho)
+    if (window.STORE) {
+      window.STORE.local_kb = window.STORE.local_kb || {};
+      window.STORE.local_kb[task.hash] = solution;
+      window.STORE.unsolved_queue = (window.STORE.unsolved_queue || []).filter(i => i.hash !== task.hash);
+      window.STORE['snap:' + task.hash] = snap;
     }
-    function afterSave() {
-      btn.textContent = '💾 Save to KB'; btn.disabled = false;
-      chrome.runtime.sendMessage({ type: 'LIVE_HIGHLIGHT', hash: task.hash, solution: solution, taskNumber: taskNumbers[task.hash] });
-      resetInputs(); showPlaceholder();
-    }
-  });
+    resetInputs(); showPlaceholder(); refresh();
+  })();
 };
 
 // ============ SKIP / DELETE ============
@@ -900,14 +895,15 @@ $('saveBtn').onclick = function() {
 $('skipBtn').onclick = function() {
   if (!currentTask) return;
   const h = currentTask.hash;
-  chrome.storage.local.get(['local_kb','unsolved_queue','solved_tasks'], (data) => {
-    let q = (data.unsolved_queue||[]).filter(i => i.hash !== h);
-    let kbn = data.local_kb||{}; delete kbn[h];
-    let solved = data.solved_tasks||{}; delete solved[h];
-    chrome.storage.local.set({ unsolved_queue:q, local_kb:kbn, solved_tasks:solved }, () => {
-      resetInputs(); showPlaceholder(); refresh();
-    });
-  });
+  (async () => {
+    await callEndpoint('/delete-task', { hash: h });
+    if (window.STORE) {
+      if (window.STORE.local_kb) delete window.STORE.local_kb[h];
+      window.STORE.unsolved_queue = (window.STORE.unsolved_queue || []).filter(i => i.hash !== h);
+      delete window.STORE['snap:' + h];
+    }
+    resetInputs(); showPlaceholder(); refresh();
+  })();
 };
 
 function showPlaceholder() {
