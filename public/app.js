@@ -9,6 +9,7 @@
 
 const SECRET_KEY = 'kb_dashboard_secret';
 let STORE = {};              // local_kb, unsolved_queue, task_numbers, task_counter, phash_index, snap:<hash>...
+window.STORE = STORE;
 let _onChangedListeners = [];
 let _ready = false;
 
@@ -66,14 +67,78 @@ function buildPayloadFromStore() {
   };
 }
 
+// LIGHTWEIGHT list endpoint se sirf meta lao (KOI images nahi) — slow internet
+// pe bhi foran. Images sirf tab aati hain jab user kisi ek task ko kholta hai
+// (ensureSnap se on-demand).
+async function serverList() {
+  const secret = getStoredSecret();
+  if (!secret) return null;
+  try {
+    const r = await fetch('/list', { headers: { 'X-Sync-Secret': secret } });
+    if (!r.ok) return { _status: r.status };
+    return await r.json();
+  } catch (e) { return { _status: 0 }; }
+}
+
+// Ek task ki images (snap) on-demand lao aur STORE me daal do
+async function ensureSnap(hash) {
+  if (STORE['snap:' + hash] && (STORE['snap:' + hash].mainImage || STORE['snap:' + hash].exampleImage || (STORE['snap:' + hash].tileImages && STORE['snap:' + hash].tileImages.length))) {
+    return STORE['snap:' + hash];
+  }
+  const secret = getStoredSecret();
+  if (!secret) return null;
+  try {
+    const r = await fetch('/snap?hash=' + encodeURIComponent(hash), { headers: { 'X-Sync-Secret': secret } });
+    if (!r.ok) return null;
+    const d = await r.json();
+    if (d.found && d.snap) {
+      STORE['snap:' + hash] = d.snap;
+      // unsolved_queue me bhi us item ko images ke saath update kar do (editor ke liye)
+      const idx = (STORE.unsolved_queue || []).findIndex(it => it.hash === hash);
+      if (idx >= 0) STORE.unsolved_queue[idx] = Object.assign({}, STORE.unsolved_queue[idx], d.snap);
+      return d.snap;
+    }
+  } catch (e) {}
+  return null;
+}
+window.ensureSnap = ensureSnap;
+
 async function pullFromServer() {
-  const p = await serverGet();
-  if (!p || p._status) return p ? p._status : -1;
-  applyServerPayload(p);
+  const list = await serverList();
+  if (!list || list._status) return list ? list._status : -1;
+
+  // Meta se STORE ka dhaancha banao (images abhi nahi — wo on-demand aayengi)
+  const kb = {}, tn = {};
+  STORE.unsolved_queue = (list.unsolved || []).map(u => {
+    if (u.number) tn[u.hash] = u.number;
+    return { hash: u.hash, text: u.text, type: u.type, taskNumber: u.number, timestamp: u.timestamp, _metaOnly: !u.hasImg ? false : true };
+  });
+  (list.trained || []).forEach(t => {
+    kb[t.hash] = { actionType: t.type, savedText: t.text, _metaOnly: true };
+    if (t.number) tn[t.hash] = t.number;
+  });
+  STORE.local_kb = kb;
+  STORE.task_numbers = tn;
+  // Purani snap:<hash> meta-only entries hata do, real ondemand aayengi
+  STORE._trainedMeta = {};
+  (list.trained || []).forEach(t => { STORE._trainedMeta[t.hash] = t; });
+
   _ready = true;
   _onChangedListeners.forEach(fn => fn({ unsolved_queue: {}, local_kb: {} }, 'local'));
   return 200;
 }
+
+// Purana full /kb (sirf Export ke liye — wahan poora data chahiye hota hai)
+async function serverGetFull() {
+  const secret = getStoredSecret();
+  if (!secret) return null;
+  try {
+    const r = await fetch('/kb', { headers: { 'X-Sync-Secret': secret } });
+    if (!r.ok) return { _status: r.status };
+    return await r.json();
+  } catch (e) { return { _status: 0 }; }
+}
+window.serverGetFull = serverGetFull;
 
 // Generic additive merge-push — SIRF bulk/additive actions (Import KB, Restore
 // Backup) ke liye. Ye kabhi kuch DELETE nahi karta, isliye safe hai.
@@ -235,10 +300,16 @@ function refresh() {
     kb = data.local_kb || {};
     queue = data.unsolved_queue || [];
     taskNumbers = data.task_numbers || {};
-    // Snapshots: legacy solved_tasks + naye per-key snap:<hash>
+    // Snapshots: legacy solved_tasks + naye per-key snap:<hash> + server meta
     solvedSnaps = Object.assign({}, data.solved_tasks || {});
     for (const k in data) {
       if (k.indexOf('snap:') === 0) solvedSnaps[k.slice(5)] = data[k];
+    }
+    // Server se aayi meta (text/type/solvedAt — bina images) merge karo taake
+    // category counts aur "Today" sahi rahein bina images download kiye
+    const tmeta = (data._trainedMeta) || (window.STORE && window.STORE._trainedMeta) || {};
+    for (const h in tmeta) {
+      solvedSnaps[h] = Object.assign({ type: tmeta[h].type, text: tmeta[h].text, solvedAt: tmeta[h].solvedAt }, solvedSnaps[h] || {});
     }
 
     const trainedKeys = Object.keys(kb);
@@ -433,22 +504,38 @@ function resetInputs() {
   selectedTiles.clear(); clickPoint = null; multiPoints = []; dragPairs = []; pendingSource = null;
 }
 
-function loadTask(task) {
+async function loadTask(task) {
   currentKey = task.hash;
-  currentTask = task;
   resetInputs();
+  // Images on-demand lao (list me images nahi aati thi, sirf meta)
+  if (window.ensureSnap && (!task.mainImage && !task.exampleImage && !(task.tileImages && task.tileImages.length))) {
+    showEditorLoading();
+    const snap = await window.ensureSnap(task.hash);
+    if (snap) task = Object.assign({}, task, snap);
+  }
+  currentTask = task;
   showEditor(task, null);
 }
 
 function loadSolved(hash) {
-  chrome.storage.local.get(['solved_tasks'], (d) => {
-    const solved = d.solved_tasks || {};
-    const task = solved[hash] || { hash, text: '(no image saved)', type: kb[hash].actionType };
+  (async () => {
+    let task = solvedSnaps[hash] || { hash, text: (kb[hash] && kb[hash].savedText) || '', type: kb[hash] && kb[hash].actionType };
     currentKey = hash;
-    currentTask = task;
     resetInputs();
+    if (window.ensureSnap && (!task.mainImage && !task.exampleImage && !(task.tileImages && task.tileImages.length))) {
+      showEditorLoading();
+      const snap = await window.ensureSnap(hash);
+      if (snap) task = Object.assign({}, task, snap);
+    }
+    currentTask = task;
     showEditor(task, kb[hash]); // prefill existing solution
-  });
+  })();
+}
+
+function showEditorLoading() {
+  $('listView').style.display = 'none';
+  $('editorView').style.display = 'block';
+  const ex = $('exampleImg'); if (ex) ex.removeAttribute('src');
 }
 
 function showEditor(task, existingSolution) {
@@ -834,15 +921,19 @@ $('backBtn').onclick = () => { resetInputs(); showPlaceholder(); };
 
 // ============ EXPORT / IMPORT / CLEAR ============
 
-$('exportBtn').onclick = function() {
-  chrome.storage.local.get(['local_kb','solved_tasks'], (data) => {
-    const out = { kb: data.local_kb||{}, solved: data.solved_tasks||{} };
-    const blob = new Blob([JSON.stringify(out,null,2)], {type:'application/json'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'hcaptcha-kb-' + new Date().toISOString().slice(0,10) + '.json';
-    a.click();
-  });
+$('exportBtn').onclick = async function() {
+  const btn = $('exportBtn'); const old = btn.textContent;
+  btn.textContent = '⏳ Export ho raha...'; btn.disabled = true;
+  // Poora data (images samet) seedha server se lao — local me ab sirf meta hota hai
+  const full = window.serverGetFull ? await window.serverGetFull() : null;
+  btn.textContent = old; btn.disabled = false;
+  if (!full || full._status) { alert('Export fail — server se data nahi mila.'); return; }
+  const out = { kb: full.kb || {}, snaps: full.snaps || {}, solved: full.snaps || {}, task_numbers: full.task_numbers || {}, phash_index: full.phash_index || {} };
+  const blob = new Blob([JSON.stringify(out,null,2)], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'hcaptcha-kb-' + new Date().toISOString().slice(0,10) + '.json';
+  a.click();
 };
 
 $('importBtn').onclick = () => $('importFile').click();
