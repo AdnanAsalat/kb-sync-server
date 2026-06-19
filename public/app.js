@@ -505,30 +505,47 @@ function resetInputs() {
 
 async function loadTask(task) {
   currentKey = task.hash;
+  currentTask = null; // purana turant clear
   resetInputs();
+  showEditorLoading();
+  clearEditorImages(); // purani image foran hata do
   // Images on-demand lao (list me images nahi aati thi, sirf meta)
   if (window.ensureSnap && (!task.mainImage && !task.exampleImage && !(task.tileImages && task.tileImages.length))) {
-    showEditorLoading();
     const snap = await window.ensureSnap(task.hash);
     if (snap) task = Object.assign({}, task, snap);
   }
+  // Agar user beech me dusra task khol chuka, ye purana response ignore karo
+  if (currentKey !== task.hash) return;
   currentTask = task;
   showEditor(task, null);
 }
 
 function loadSolved(hash) {
   (async () => {
-    let task = solvedSnaps[hash] || { hash, text: (kb[hash] && kb[hash].savedText) || '', type: kb[hash] && kb[hash].actionType };
     currentKey = hash;
+    currentTask = null;
     resetInputs();
+    showEditorLoading();
+    clearEditorImages();
+    let task = solvedSnaps[hash] || { hash, text: (kb[hash] && kb[hash].savedText) || '', type: kb[hash] && kb[hash].actionType };
     if (window.ensureSnap && (!task.mainImage && !task.exampleImage && !(task.tileImages && task.tileImages.length))) {
-      showEditorLoading();
       const snap = await window.ensureSnap(hash);
       if (snap) task = Object.assign({}, task, snap);
     }
+    if (currentKey !== hash) return; // beech me dusra khul gaya
     currentTask = task;
     showEditor(task, kb[hash]); // prefill existing solution
   })();
+}
+
+function clearEditorImages() {
+  const ex = $('exampleImg'); if (ex) ex.removeAttribute('src');
+  const ci = $('clickImg'); if (ci) ci.removeAttribute('src');
+  const di = $('dragImg'); if (di) di.removeAttribute('src');
+  const tg = $('tileGrid'); if (tg) tg.innerHTML = '';
+  $('gridSection').style.display = 'none';
+  $('clickSection').style.display = 'none';
+  $('dragSection').style.display = 'none';
 }
 
 function showEditorLoading() {
