@@ -386,10 +386,45 @@ function thumbHTML(snap, cat) {
   }
   const main = snap.mainImage || snap.exampleImage || goodTiles[0] || '';
   if (main) return `<img class="single" loading="lazy" src="${main}">`;
-  return `<div class="noimg" style="flex-direction:column;gap:8px;color:#64748b;">
-    <div style="font-size:34px;">🧩</div>
-    <div style="font-size:12px;">Preview nahi (trained ✅)</div>
+  // Image abhi local me nahi — placeholder. Lazy loader (neeche) screen pe
+  // aate hi snap fetch karega aur ye replace ho jayega.
+  return `<div class="noimg lazy-thumb" style="flex-direction:column;gap:6px;color:#64748b;">
+    <div class="spin" style="width:22px;height:22px;border:3px solid #334155;border-top-color:#a78bfa;border-radius:50%;animation:spin 0.8s linear infinite;"></div>
+    <div style="font-size:11px;">Preview aa rahi…</div>
   </div>`;
+}
+
+// Lazy thumbnail loader — card screen pe aate hi uska snap fetch karke thumb bhar do
+let _thumbObserver = null;
+function setupThumbLazyLoad() {
+  if (_thumbObserver) _thumbObserver.disconnect();
+  _thumbObserver = new IntersectionObserver((entries) => {
+    entries.forEach(async (ent) => {
+      if (!ent.isIntersecting) return;
+      const card = ent.target;
+      _thumbObserver.unobserve(card);
+      const hash = card.dataset.hash;
+      if (!hash || !window.ensureSnap) return;
+      const snap = await window.ensureSnap(hash);
+      if (!snap) {
+        const ph = card.querySelector('.lazy-thumb');
+        if (ph) ph.innerHTML = '<div style="font-size:30px;">🧩</div><div style="font-size:11px;">Preview nahi</div>';
+        return;
+      }
+      const cat = card.dataset.cat || 'click';
+      const thumb = card.querySelector('.thumb');
+      if (thumb) {
+        // num/cat/del badge wapas rakhte hue sirf preview replace karo
+        const num = card.dataset.num;
+        thumb.innerHTML = `
+          <span class="num-badge">#${num}</span>
+          <span class="cat-badge ${cat}">${cat}</span>
+          ${thumbHTML(snap, cat)}
+          <button class="del" title="Delete">🗑️</button>`;
+        thumb.querySelector('.del').onclick = (ev) => { ev.stopPropagation(); quickDelete(hash); };
+      }
+    });
+  }, { rootMargin: '200px' });
 }
 
 let _pageSize = 24;       // ek baar me kitne cards
@@ -436,6 +471,7 @@ function renderCards(keepShown) {
   }
 
   const slice = entries.slice(0, _shown);
+  setupThumbLazyLoad(); // har render pe fresh observer
   const frag = document.createDocumentFragment();
   slice.forEach(e => frag.appendChild(makeCard(e.hash, e.item, e.isSolved)));
   grid.appendChild(frag);
@@ -457,16 +493,20 @@ function makeCard(hash, item, isSolved) {
   const cat = categoryOf(hash, item, isSolved);
   const card = document.createElement('div');
   card.className = 'card';
+  card.dataset.hash = hash;
+  card.dataset.cat = cat;
+  card.dataset.num = numOf(hash);
 
   const dateMs = isSolved ? (item.solvedAt || item.timestamp) : item.timestamp;
   const dateStr = dateMs ? new Date(dateMs).toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '';
   const text = (item.text || '(no text)');
 
+  const inner = thumbHTML(item, cat);
   card.innerHTML = `
     <div class="thumb">
       <span class="num-badge">#${numOf(hash)}</span>
       <span class="cat-badge ${cat}">${cat}</span>
-      ${thumbHTML(item, cat)}
+      ${inner}
       <button class="del" title="Delete">🗑️</button>
     </div>
     <div class="meta">
@@ -476,6 +516,9 @@ function makeCard(hash, item, isSolved) {
 
   card.querySelector('.del').onclick = (ev) => { ev.stopPropagation(); quickDelete(hash); };
   card.onclick = () => isSolved ? loadSolved(hash) : loadTask(item);
+
+  // Agar thumbnail abhi missing hai (lazy), observer me daal do
+  if (inner.includes('lazy-thumb') && _thumbObserver) _thumbObserver.observe(card);
   return card;
 }
 
