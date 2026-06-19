@@ -214,6 +214,47 @@ app.post('/reset-all', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ===== LIGHTWEIGHT LIST (sirf meta — KOI images nahi, isliye bohot TEZ) =====
+// Dashboard isi se list dikhata hai. Slow internet pe bhi foran load hota hai,
+// kyunke 95 trained tasks ki images download NAHI hoti — sirf naam/number/type.
+app.get('/list', auth, (req, res) => {
+  const store = readStore();
+  const kb = store.kb || {};
+  const tn = store.task_numbers || {};
+  const snaps = store.snaps || {};
+
+  const unsolved = (store.unsolved || []).map(it => ({
+    hash: it.hash, text: it.text || '', type: it.type || 'click',
+    number: tn[it.hash] || null, timestamp: it.timestamp || 0,
+    hasImg: !!(it.mainImage || it.exampleImage || (it.tileImages && it.tileImages.length))
+  }));
+
+  const trained = Object.keys(kb).map(h => {
+    const s = snaps[h] || {};
+    return {
+      hash: h, text: s.text || (kb[h] && kb[h].savedText) || '', type: s.type || (kb[h] && kb[h].actionType) || 'click',
+      number: tn[h] || null, solvedAt: s.solvedAt || 0,
+      hasImg: !!(s.mainImage || s.exampleImage || (s.tileImages && s.tileImages.length))
+    };
+  });
+
+  res.json({
+    unsolvedCount: unsolved.length,
+    trainedCount: trained.length,
+    unsolved, trained
+  });
+});
+
+// ===== SINGLE TASK SNAP (images) — jab user ek card/editor kholay tabhi =====
+app.get('/snap', auth, (req, res) => {
+  const hash = req.query.hash || '';
+  const store = readStore();
+  const fromUnsolved = (store.unsolved || []).find(it => it.hash === hash);
+  const snap = (store.snaps || {})[hash] || fromUnsolved || null;
+  const solution = (store.kb || {})[hash] || null;
+  res.json({ found: !!snap, snap, solution });
+});
+
 // ===== BULK (dashboard ke Export/Import/Reset/listing ke liye) =====
 app.get('/kb', auth, (req, res) => {
   res.json(readStore());
