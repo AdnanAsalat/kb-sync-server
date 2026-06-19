@@ -79,19 +79,27 @@ app.get('/health', (req, res) => {
 app.get('/solve', auth, (req, res) => {
   const hash = req.query.hash || '';
   const phash = req.query.phash || '';
+  const isGrid = req.query.grid === '1'; // grid/multi-tile tasks
   const store = readStore();
   if (hash && store.kb[hash]) {
     return res.json({ found: true, solution: store.kb[hash], number: (store.task_numbers || {})[hash] || null });
   }
-  if (phash) {
+  // pHash (visual) fallback SIRF single-image tasks ke liye. Grid tasks (jaise
+  // "find ALL objects matching number") ke parts aapas me bohot milte-julte
+  // dikhte hain — un par visual match GALAT solution laga deta tha. Grid sirf
+  // exact hash se match honge (jo tile IDs se already unique banta hai).
+  if (phash && !isGrid) {
     const idx = store.phash_index || {};
     let best = null, bestDist = 999;
     for (const h in idx) {
       if (!store.kb[h]) continue;
+      // Sirf un trained tasks se compare karo jo khud grid nahi the
+      const sn = (store.snaps || {})[h];
+      if (sn && sn.type === 'grid') continue;
       const d = hammingDist(phash, idx[h]);
       if (d < bestDist) { bestDist = d; best = h; }
     }
-    if (best && bestDist <= 5) {
+    if (best && bestDist <= 3) { // 5 se 3 — aur sakht
       return res.json({ found: true, solution: store.kb[best], number: (store.task_numbers || {})[best] || null });
     }
   }
