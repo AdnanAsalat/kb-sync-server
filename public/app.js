@@ -872,22 +872,19 @@ $('saveBtn').onclick = function() {
     solvedAt: Date.now()
   };
 
-  // SEEDHA /train endpoint — koi guess/merge nahi, isliye foran aur reliable.
-  (async () => {
-    const ok = await callEndpoint('/train', {
-      hash: task.hash, solution, snap, phash: task._phash
-    });
-    btn.textContent = '💾 Save to KB'; btn.disabled = false;
-    if (!ok) { alert('Save fail — internet/secret check karein.'); return; }
-    // Local STORE me bhi turant reflect karo (taake list foran update ho)
-    if (window.STORE) {
-      window.STORE.local_kb = window.STORE.local_kb || {};
-      window.STORE.local_kb[task.hash] = solution;
-      window.STORE.unsolved_queue = (window.STORE.unsolved_queue || []).filter(i => i.hash !== task.hash);
-      window.STORE['snap:' + task.hash] = snap;
-    }
-    resetInputs(); showPlaceholder(); refresh();
-  })();
+  // SEEDHA /train endpoint. UI ko turant free kar do — upload background me
+  // hota rahega (slow internet pe images bade hote hain, user ko rukna na pade).
+  callEndpoint('/train', { hash: task.hash, solution, snap, phash: task._phash })
+    .then(ok => { if (!ok) console.log('[Dash] train upload fail'); });
+  // Local STORE turant update — list foran update dikhe
+  if (window.STORE) {
+    window.STORE.local_kb = window.STORE.local_kb || {};
+    window.STORE.local_kb[task.hash] = solution;
+    window.STORE.unsolved_queue = (window.STORE.unsolved_queue || []).filter(i => i.hash !== task.hash);
+    window.STORE['snap:' + task.hash] = snap;
+  }
+  btn.textContent = '💾 Save to KB'; btn.disabled = false;
+  resetInputs(); showPlaceholder(); refresh();
 };
 
 // ============ SKIP / DELETE ============
