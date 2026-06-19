@@ -1113,16 +1113,15 @@ $('refreshBtn').onclick = async () => {
   }
 })();
 
-// Dashboard JAB TAK KHULA HAI tabhi tak — har 12 sec me halka silent sync
-// (taake doosre PC/browser ka naya unsolved task yahan khud aa jaye, live feel).
-// Tab band karo to ye khud band ho jata hai.
+// Dashboard JAB TAK KHULA HAI tabhi tak — har 4 sec halka silent sync (ab
+// /list lightweight hai, sirf meta aata hai, isliye fast). Naya task jaldi dikhe.
 const _liveInterval = setInterval(async () => {
   if (!_ready) return;
   if (currentTask) return; // editor khula hai — disturb mat karo
   if ($('editorView').style.display === 'block') return;
   const status = await pullFromServer();
   if (status === 200) refresh();
-}, 12000);
+}, 4000);
 window.addEventListener('beforeunload', () => clearInterval(_liveInterval));
 
 // Jab pullFromServer() data badle to render update karo (debounced)
