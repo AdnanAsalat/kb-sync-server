@@ -207,6 +207,19 @@ app.post('/delete-task', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ===== BULK DELETE (multiple tasks ek saath) =====
+app.post('/delete-many', auth, (req, res) => {
+  const hashes = (req.body || {}).hashes || [];
+  const store = readStore();
+  hashes.forEach(h => {
+    delete (store.kb || {})[h];
+    delete (store.snaps || {})[h];
+    store.unsolved = (store.unsolved || []).filter(it => it.hash !== h);
+  });
+  writeStore(store);
+  res.json({ ok: true, deleted: hashes.length });
+});
+
 // ===== CLEAR UNSOLVED QUEUE (authoritative — koi merge nahi, seedha khaali) =====
 app.post('/clear-unsolved', auth, (req, res) => {
   const store = readStore();
