@@ -170,6 +170,7 @@
 
     <div class="toolbar">
       <button class="btn-export" id="manualAddBtn" style="background:#059669;">📷 Apni Image se Train</button>
+      <button class="btn-export" id="selectModeBtn" style="background:#0ea5e9;">☑️ Select</button>
       <button class="btn-export" id="exportBtn">📦 Export KB</button>
       <button class="btn-import" id="importBtn">📥 Import KB</button>
       <button class="btn-restore" id="restoreBtn">♻️ Restore Backup</button>
@@ -177,6 +178,12 @@
       <button class="btn-clear" id="resetAllBtn">💥 Reset All</button>
       <input type="file" id="importFile" accept=".json" style="display:none;">
       <input type="file" id="manualImgFile" accept="image/*" style="display:none;">
+    </div>
+    <div id="selectBar" style="display:none;align-items:center;gap:12px;padding:10px 14px;margin:8px 0;background:#1e1b4b;border-radius:10px;">
+      <span id="selCount" style="color:#c4b5fd;font-weight:600;">0 selected</span>
+      <button id="selAllBtn" style="background:#6d28d9;color:#fff;border:none;padding:8px 16px;border-radius:8px;cursor:pointer;">Sab select</button>
+      <button id="selDeleteBtn" style="background:#dc2626;color:#fff;border:none;padding:8px 16px;border-radius:8px;cursor:pointer;font-weight:600;">🗑️ Selected delete</button>
+      <button id="selCancelBtn" style="background:#475569;color:#fff;border:none;padding:8px 16px;border-radius:8px;cursor:pointer;">Cancel</button>
     </div>
   </div>
 
