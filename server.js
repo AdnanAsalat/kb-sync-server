@@ -144,7 +144,21 @@ app.post('/train', auth, (req, res) => {
   store.phash_index = store.phash_index || {};
 
   store.kb[t.hash] = t.solution;
-  if (t.snap) store.snaps[t.hash] = t.snap;
+
+  let snap = t.snap;
+  const hasImages = (s) => s && (s.mainImage || s.exampleImage || (s.tileImages && s.tileImages.length));
+  if (!hasImages(snap)) {
+    // Train call me images nahi aayi (kisi bhi wajah se) — purani unsolved
+    // entry me agar images hain (jab pehli baar queue hua tha) to wo use karo,
+    // taake "Preview nahi" na dikhe.
+    const orig = store.unsolved.find(it => it.hash === t.hash);
+    if (orig && hasImages(orig)) {
+      snap = Object.assign({}, orig, snap || {});
+    }
+  }
+  if (hasImages(snap)) store.snaps[t.hash] = snap;
+  else if (!store.snaps[t.hash]) store.snaps[t.hash] = snap || { hash: t.hash };
+
   store.unsolved = store.unsolved.filter(it => it.hash !== t.hash);
   if (t.phash) store.phash_index[t.hash] = t.phash;
   if (!store.task_numbers[t.hash]) {
