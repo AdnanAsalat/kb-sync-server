@@ -394,37 +394,59 @@ function thumbHTML(snap, cat) {
   </div>`;
 }
 
-// Lazy thumbnail loader — card screen pe aate hi uska snap fetch karke thumb bhar do
+// Lazy thumbnail loader — ek waqt me EK snap fetch (queue), taake slow net pe
+// server par 24 requests ek saath na jaayein (jisse sab "atke" lagte the).
 let _thumbObserver = null;
+let _snapQueue = [];
+let _snapBusy = false;
+
+async function _drainSnapQueue() {
+  if (_snapBusy) return;
+  _snapBusy = true;
+  while (_snapQueue.length) {
+    const { hash, card } = _snapQueue.shift();
+    if (!document.body.contains(card)) continue; // card hata diya gaya
+    try {
+      const snap = window.ensureSnap ? await window.ensureSnap(hash) : null;
+      const thumb = card.querySelector('.thumb');
+      if (!thumb) continue;
+      const cat = card.dataset.cat || 'click';
+      const num = card.dataset.num;
+      if (!snap) {
+        const ph = card.querySelector('.lazy-thumb');
+        if (ph) ph.innerHTML = '<div style="font-size:30px;">🧩</div><div style="font-size:11px;">Preview nahi</div>';
+        continue;
+      }
+      const cbHtml = _selectMode ? `<input type="checkbox" class="sel-cb" ${_selectedHashes.has(hash) ? 'checked' : ''} style="position:absolute;top:8px;left:8px;width:22px;height:22px;z-index:5;cursor:pointer;">` : '';
+      thumb.innerHTML = `${cbHtml}
+        <span class="num-badge">#${num}</span>
+        <span class="cat-badge ${cat}">${cat}</span>
+        ${thumbHTML(snap, cat)}
+        <button class="del" title="Delete">🗑️</button>`;
+      thumb.querySelector('.del').onclick = (ev) => { ev.stopPropagation(); quickDelete(hash); };
+      if (_selectMode) {
+        const cb = thumb.querySelector('.sel-cb');
+        if (cb) cb.onclick = (ev) => { ev.stopPropagation(); if (cb.checked) _selectedHashes.add(hash); else _selectedHashes.delete(hash); updateSelCount(); };
+      }
+    } catch (e) {}
+  }
+  _snapBusy = false;
+}
+
 function setupThumbLazyLoad() {
   if (_thumbObserver) _thumbObserver.disconnect();
+  _snapQueue = [];
   _thumbObserver = new IntersectionObserver((entries) => {
-    entries.forEach(async (ent) => {
+    entries.forEach((ent) => {
       if (!ent.isIntersecting) return;
       const card = ent.target;
       _thumbObserver.unobserve(card);
       const hash = card.dataset.hash;
       if (!hash || !window.ensureSnap) return;
-      const snap = await window.ensureSnap(hash);
-      if (!snap) {
-        const ph = card.querySelector('.lazy-thumb');
-        if (ph) ph.innerHTML = '<div style="font-size:30px;">🧩</div><div style="font-size:11px;">Preview nahi</div>';
-        return;
-      }
-      const cat = card.dataset.cat || 'click';
-      const thumb = card.querySelector('.thumb');
-      if (thumb) {
-        // num/cat/del badge wapas rakhte hue sirf preview replace karo
-        const num = card.dataset.num;
-        thumb.innerHTML = `
-          <span class="num-badge">#${num}</span>
-          <span class="cat-badge ${cat}">${cat}</span>
-          ${thumbHTML(snap, cat)}
-          <button class="del" title="Delete">🗑️</button>`;
-        thumb.querySelector('.del').onclick = (ev) => { ev.stopPropagation(); quickDelete(hash); };
-      }
+      _snapQueue.push({ hash, card });
+      _drainSnapQueue();
     });
-  }, { rootMargin: '200px' });
+  }, { rootMargin: '300px' });
 }
 
 let _pageSize = 24;       // ek baar me kitne cards
@@ -502,8 +524,10 @@ function makeCard(hash, item, isSolved) {
   const text = (item.text || '(no text)');
 
   const inner = thumbHTML(item, cat);
+  const checked = _selectedHashes.has(hash) ? 'checked' : '';
   card.innerHTML = `
     <div class="thumb">
+      ${_selectMode ? `<input type="checkbox" class="sel-cb" ${checked} style="position:absolute;top:8px;left:8px;width:22px;height:22px;z-index:5;cursor:pointer;">` : ''}
       <span class="num-badge">#${numOf(hash)}</span>
       <span class="cat-badge ${cat}">${cat}</span>
       ${inner}
@@ -515,11 +539,72 @@ function makeCard(hash, item, isSolved) {
     </div>`;
 
   card.querySelector('.del').onclick = (ev) => { ev.stopPropagation(); quickDelete(hash); };
-  card.onclick = () => isSolved ? loadSolved(hash) : loadTask(item);
 
-  // Agar thumbnail abhi missing hai (lazy), observer me daal do
+  if (_selectMode) {
+    const cb = card.querySelector('.sel-cb');
+    cb.onclick = (ev) => {
+      ev.stopPropagation();
+      if (cb.checked) _selectedHashes.add(hash); else _selectedHashes.delete(hash);
+      updateSelCount();
+    };
+    card.onclick = () => { cb.checked = !cb.checked; cb.onclick({ stopPropagation(){} }); };
+  } else {
+    card.onclick = () => isSolved ? loadSolved(hash) : loadTask(item);
+  }
+
   if (inner.includes('lazy-thumb') && _thumbObserver) _thumbObserver.observe(card);
   return card;
+}
+
+// ===== SELECT MODE (multi-delete) =====
+let _selectMode = false;
+let _selectedHashes = new Set();
+
+function updateSelCount() {
+  const el = $('selCount');
+  if (el) el.textContent = _selectedHashes.size + ' selected';
+}
+
+function setupSelectMode() {
+  $('selectModeBtn').onclick = () => {
+    _selectMode = !_selectMode;
+    _selectedHashes.clear();
+    $('selectBar').style.display = _selectMode ? 'flex' : 'none';
+    $('selectModeBtn').style.background = _selectMode ? '#0369a1' : '#0ea5e9';
+    updateSelCount();
+    renderCards(true);
+  };
+  $('selCancelBtn').onclick = () => {
+    _selectMode = false; _selectedHashes.clear();
+    $('selectBar').style.display = 'none';
+    $('selectModeBtn').style.background = '#0ea5e9';
+    renderCards(true);
+  };
+  $('selAllBtn').onclick = () => {
+    (_lastEntries || []).forEach(e => _selectedHashes.add(e.hash));
+    updateSelCount();
+    renderCards(true);
+  };
+  $('selDeleteBtn').onclick = async () => {
+    const hashes = [..._selectedHashes];
+    if (!hashes.length) { alert('Pehle kuch select karein.'); return; }
+    if (!confirm(hashes.length + ' tasks delete karein?')) return;
+    const btn = $('selDeleteBtn'); btn.textContent = '⏳ Delete ho raha...'; btn.disabled = true;
+    const ok = await callEndpoint('/delete-many', { hashes });
+    btn.textContent = '🗑️ Selected delete'; btn.disabled = false;
+    if (!ok) { alert('Delete fail — internet/secret check karein.'); return; }
+    if (window.STORE) {
+      hashes.forEach(h => {
+        if (window.STORE.local_kb) delete window.STORE.local_kb[h];
+        delete window.STORE['snap:' + h];
+      });
+      window.STORE.unsolved_queue = (window.STORE.unsolved_queue || []).filter(i => !_selectedHashes.has(i.hash));
+    }
+    _selectMode = false; _selectedHashes.clear();
+    $('selectBar').style.display = 'none';
+    $('selectModeBtn').style.background = '#0ea5e9';
+    refresh();
+  };
 }
 
 function escapeHtml(s) {
@@ -1010,30 +1095,31 @@ $('importFile').onchange = function() {
 };
 
 $('clearQueueBtn').onclick = function() {
-  if (!confirm('Unsolved queue + purana backup clear karein? (KB safe rahega)')) return;
-  // Queue aur purana backup dono saaf — storage free karne ke liye
-  chrome.storage.local.remove(['unsolved_queue', 'kb_backup'], () => {
-    chrome.storage.local.set({ unsolved_queue: [] }, () => { showPlaceholder(); refresh(); });
-  });
+  if (!confirm('Unsolved queue clear karein? (Trained KB safe rahega)')) return;
+  (async () => {
+    const ok = await callEndpoint('/clear-unsolved');
+    if (!ok) { alert('Clear fail — internet/secret check karein.'); return; }
+    if (window.STORE) window.STORE.unsolved_queue = [];
+    queue = [];
+    showPlaceholder(); refresh();
+  })();
 };
 
 $('resetAllBtn').onclick = function() {
-  if (!confirm('⚠️ SAB KUCH delete ho jayega:\n• Saari Trained training (KB)\n• Unsolved queue\n• Task numbers\n• Backup\n\nYe wapas nahi aayega. Pakka?')) return;
+  if (!confirm('⚠️ SAB KUCH delete ho jayega:\n• Saari Trained training (KB)\n• Unsolved queue\n• Task numbers\n\nYe wapas nahi aayega. Pakka?')) return;
   if (!confirm('Aakhri baar: Sach me sab kuch reset karna hai?')) return;
-  chrome.storage.local.get(null, (all) => {
-    const snapKeys = Object.keys(all).filter(k => k.indexOf('snap:') === 0);
-    const toRemove = ['local_kb', 'unsolved_queue', 'solved_tasks', 'task_numbers', 'task_counter', 'kb_backup'].concat(snapKeys);
-    chrome.storage.local.remove(toRemove, () => {
-      chrome.storage.local.set({
-        local_kb: {}, unsolved_queue: [], solved_tasks: {},
-        task_numbers: {}, task_counter: 0
-      }, () => {
-        alert('✅ Sab kuch reset ho gaya. Numbers ab #1 se shuru honge.');
-        kb = {}; queue = []; solvedSnaps = {}; taskNumbers = {};
-        showPlaceholder(); refresh();
-      });
-    });
-  });
+  (async () => {
+    const ok = await callEndpoint('/reset-all');
+    if (!ok) { alert('Reset fail — internet/secret check karein.'); return; }
+    if (window.STORE) {
+      window.STORE.local_kb = {}; window.STORE.unsolved_queue = [];
+      window.STORE.task_numbers = {}; window.STORE._trainedMeta = {};
+      Object.keys(window.STORE).forEach(k => { if (k.indexOf('snap:') === 0) delete window.STORE[k]; });
+    }
+    kb = {}; queue = []; solvedSnaps = {}; taskNumbers = {};
+    alert('✅ Sab kuch reset ho gaya. Numbers ab #1 se shuru honge.');
+    showPlaceholder(); refresh();
+  })();
 };
 
 $('restoreBtn').onclick = function() {
@@ -1162,6 +1248,7 @@ $('refreshBtn').onclick = async () => {
 
 // Pehli load: agar pehle se secret saved hai to seedha connect karo
 (async () => {
+  setupSelectMode();
   const saved = getStoredSecret();
   if (saved) {
     $('syncSecretInput').value = saved;
